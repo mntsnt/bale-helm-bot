@@ -156,8 +156,8 @@ def extract_user_id_from_message(message: Optional[Message]) -> Optional[int]:
     for text in candidates:
         if not text:
             continue
-        # Matches 'ID: 12345' or 'ID: <code>12345</code>'
-        match = re.search(r"ID:\s*(?:<code>)?(\d+)", text, re.IGNORECASE)
+        # Matches 'ID: 12345', '🆔 ID: 12345', or '🆔 12345'
+        match = re.search(r"(?:ID|🆔)[:\s]*(?:<code>)?(\d+)", text, re.IGNORECASE)
         if match:
             try:
                 return int(match.group(1))
@@ -393,24 +393,25 @@ async def handle_comment(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
     is_anonymous = context.user_data.get("is_anonymous", False)
     user_id = user.id
+    time_str = datetime.now(timezone.utc).strftime("%H:%M UTC")
 
     if is_anonymous:
         header_text = (
-            f"📬 <b>New Comment Received (Anonymous 🕵️)</b>\n\n"
-            f"<b>From:</b> <i>Anonymous Member</i>\n"
-            f"<b>Username:</b> <i>hidden</i>\n"
-            f"<b>ID:</b> <code>{user_id}</code>\n\n"
-            f"💡 <i>Reply to this header or the copied message below to answer the user anonymously.</i>"
+            "╭─ 🕵️ <b>ANONYMOUS COMMENT</b>\n"
+            "│ 👤 <i>Hidden identity</i>\n"
+            f"│ 🆔 <b>ID:</b> <code>{user_id}</code>  ·  🕒 <code>{time_str}</code>\n"
+            "╰────────────────────────\n"
+            "<i>↩ Swipe to reply</i>"
         )
     else:
         full_name = html.escape(user.full_name or "Unknown")
-        username = f"@{html.escape(user.username)}" if user.username else "no username"
+        user_handle = f" (@{html.escape(user.username)})" if user.username else ""
         header_text = (
-            f"📬 <b>New Comment Received</b>\n\n"
-            f"<b>From:</b> {full_name}\n"
-            f"<b>Username:</b> {username}\n"
-            f"<b>ID:</b> <code>{user_id}</code>\n\n"
-            f"💡 <i>Reply to this header or the copied message below to answer the user.</i>"
+            "╭─ 💬 <b>NEW COMMENT</b>\n"
+            f"│ 👤 <b>{full_name}</b>{user_handle}\n"
+            f"│ 🆔 <b>ID:</b> <code>{user_id}</code>  ·  🕒 <code>{time_str}</code>\n"
+            "╰────────────────────────\n"
+            "<i>↩ Swipe to reply</i>"
         )
 
     try:
@@ -730,7 +731,7 @@ async def handle_admin_reply(update: Update, context: ContextTypes.DEFAULT_TYPE)
                     message_id=admin_msg.message_id,
                 )
 
-        await admin_msg.reply_text("✅ Sent.")
+        await admin_msg.reply_text("✓ <b>Sent.</b>", parse_mode=ParseMode.HTML)
         logger.info("Admin replied successfully to user ID %s", target_user_id)
 
     except Forbidden:
