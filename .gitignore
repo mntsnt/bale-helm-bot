@@ -11,6 +11,15 @@ __pycache__/
 # Environment variables
 .env
 
-# Logs and databases
-*.log
+# SQLite Database
+*.db
+*.sqlite
+*.sqlite3
 data/
+
+# Export temporary files
+*.zip
+exports/
+
+# Logs
+*.log
