@@ -1,6 +1,6 @@
 # Bale Helm Telegram Bot
 
-Feedback and comment collection bot for the **[Bale Helm | ባለ ሕልም](https://t.me/bale_helm)** Telegram channel. Collects member comments, forwards them to the channel admin, and delivers admin replies back to users.
+Feedback and comment collection bot for the **[Bale Helm | ባለ ሕልም](https://t.me/bale_helm)** Telegram channel. Collects member comments (with optional anonymity), forwards them to the channel admin, and delivers admin replies back to users.
 
 ## Setup
 

@@ -2,7 +2,8 @@
 """
 Bale Helm Telegram Bot
 A Telegram bot for the Bale Helm channel (https://t.me/bale_helm).
-Collects comments, feedback, and suggestions from members and forwards them to the channel admin.
+Collects comments, feedback, and suggestions from members (with optional anonymity)
+and forwards them to the channel admin.
 Enables the admin to reply directly to user comments from Telegram.
 """
 
@@ -56,7 +57,8 @@ logging.basicConfig(
 logger = logging.getLogger("bale_helm_bot")
 
 # Conversation states
-WAITING_FOR_COMMENT = 1
+CHOOSING_ANONYMITY = 1
+WAITING_FOR_COMMENT = 2
 
 
 # ---------------------------------------------------------------------------
@@ -105,6 +107,18 @@ def get_start_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(keyboard)
 
 
+def get_anonymity_keyboard() -> InlineKeyboardMarkup:
+    """Returns the inline keyboard for choosing anonymity."""
+    keyboard = [
+        [
+            InlineKeyboardButton("👤 With Name", callback_data="mode_named"),
+            InlineKeyboardButton("🕵️ Anonymous", callback_data="mode_anon"),
+        ],
+        [InlineKeyboardButton("« Cancel", callback_data="cancel_comment")],
+    ]
+    return InlineKeyboardMarkup(keyboard)
+
+
 # ---------------------------------------------------------------------------
 # User Handlers: Start, Cancel & Comment Submission
 # ---------------------------------------------------------------------------
@@ -113,6 +127,7 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
     Handles /start command. Greets the user, links to @bale_helm,
     and displays the '💬 Send a comment' button.
     """
+    context.user_data.pop("is_anonymous", None)
     user_name = update.effective_user.first_name if update.effective_user else "there"
     welcome_text = (
         f"👋 Hello, <b>{html.escape(user_name)}</b>!\n\n"
@@ -144,19 +159,48 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
 async def start_comment_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     """
     Triggered when the user taps '💬 Send a comment'.
-    Prompts the user to enter their message.
+    Presents the choice between submitting with their name or anonymously.
     """
     query = update.callback_query
     await query.answer()
 
     prompt_text = (
+        "🔒 <b>Choose comment mode:</b>\n\n"
+        "• <b>👤 With Name:</b> Your name and @username will be visible to the admin.\n"
+        "• <b>🕵️ Anonymous:</b> Your identity will be hidden from the admin.\n\n"
+        "How would you like to send your comment?"
+    )
+
+    await query.message.reply_text(
+        text=prompt_text,
+        reply_markup=get_anonymity_keyboard(),
+        parse_mode=ParseMode.HTML,
+    )
+
+    return CHOOSING_ANONYMITY
+
+
+async def set_comment_mode(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """
+    Records whether the comment will be anonymous and prompts for the message.
+    """
+    query = update.callback_query
+    await query.answer()
+
+    is_anon = query.data == "mode_anon"
+    context.user_data["is_anonymous"] = is_anon
+
+    mode_label = "🕵️ <b>Anonymous</b>" if is_anon else "👤 <b>With Name</b>"
+
+    prompt_text = (
+        f"Selected mode: {mode_label}\n\n"
         "✍️ <b>Please write your message or comment below.</b>\n\n"
         "You can send text, photos, voice notes, videos, documents, or any other media.\n"
         "Feel free to share suggestions to add or remove content, feedback, or any thoughts.\n\n"
         "<i>Send /cancel at any time if you change your mind.</i>"
     )
 
-    await query.message.reply_text(
+    await query.edit_message_text(
         text=prompt_text,
         parse_mode=ParseMode.HTML,
     )
@@ -167,8 +211,11 @@ async def start_comment_callback(update: Update, context: ContextTypes.DEFAULT_T
 async def handle_comment(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     """
     Receives the user's comment (any message type) and forwards it to ADMIN_ID.
+    Respects the anonymity choice:
+      - If anonymous: hides full name and username.
+      - If with name: includes full name and @username.
     Sends:
-      1. An HTML-formatted header with user details.
+      1. An HTML-formatted header with details and user ID.
       2. The user's original message copied right underneath as a reply to the header.
     """
     user = update.effective_user
@@ -185,18 +232,27 @@ async def handle_comment(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         )
         return ConversationHandler.END
 
-    # Escape user input for safe HTML inclusion
-    full_name = html.escape(user.full_name or "Unknown")
-    username = f"@{html.escape(user.username)}" if user.username else "no username"
+    is_anonymous = context.user_data.get("is_anonymous", False)
     user_id = user.id
 
-    header_text = (
-        f"📬 <b>New Comment Received</b>\n\n"
-        f"<b>From:</b> {full_name}\n"
-        f"<b>Username:</b> {username}\n"
-        f"<b>ID:</b> <code>{user_id}</code>\n\n"
-        f"💡 <i>Reply to this header or the copied message below to answer the user.</i>"
-    )
+    if is_anonymous:
+        header_text = (
+            f"📬 <b>New Comment Received (Anonymous 🕵️)</b>\n\n"
+            f"<b>From:</b> <i>Anonymous Member</i>\n"
+            f"<b>Username:</b> <i>hidden</i>\n"
+            f"<b>ID:</b> <code>{user_id}</code>\n\n"
+            f"💡 <i>Reply to this header or the copied message below to answer the user anonymously.</i>"
+        )
+    else:
+        full_name = html.escape(user.full_name or "Unknown")
+        username = f"@{html.escape(user.username)}" if user.username else "no username"
+        header_text = (
+            f"📬 <b>New Comment Received</b>\n\n"
+            f"<b>From:</b> {full_name}\n"
+            f"<b>Username:</b> {username}\n"
+            f"<b>ID:</b> <code>{user_id}</code>\n\n"
+            f"💡 <i>Reply to this header or the copied message below to answer the user.</i>"
+        )
 
     try:
         # Step 1: Send the header message to the admin
@@ -215,12 +271,24 @@ async def handle_comment(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         )
 
         # Step 3: Confirm to user
+        confirmation_text = (
+            "✅ <b>Thank you!</b> Your anonymous comment has been delivered to the channel admin.\n\n"
+            "You can send /start anytime to submit another message."
+            if is_anonymous
+            else "✅ <b>Thank you!</b> Your comment has been delivered to the channel admin.\n\n"
+            "You can send /start anytime to submit another message."
+        )
+
         await incoming_msg.reply_text(
-            "✅ <b>Thank you!</b> Your comment has been delivered to the channel admin.\n\n"
-            "You can send /start anytime to submit another message.",
+            confirmation_text,
             parse_mode=ParseMode.HTML,
         )
-        logger.info("Successfully forwarded comment from user ID %s to admin %s", user_id, ADMIN_ID)
+        logger.info(
+            "Forwarded %s comment from user ID %s to admin %s",
+            "anonymous" if is_anonymous else "named",
+            user_id,
+            ADMIN_ID,
+        )
 
     except Forbidden:
         logger.error(
@@ -236,6 +304,8 @@ async def handle_comment(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         await incoming_msg.reply_text(
             "⚠️ An error occurred while sending your comment. Please try again in a few moments."
         )
+    finally:
+        context.user_data.pop("is_anonymous", None)
 
     return ConversationHandler.END
 
@@ -244,11 +314,27 @@ async def cancel_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     """
     Cancels the comment submission process and resets the state.
     """
+    context.user_data.pop("is_anonymous", None)
     if update.message:
         await update.message.reply_text(
             "❌ Comment submission canceled.\n\n"
             "Send /start whenever you'd like to share something with us!"
         )
+    return ConversationHandler.END
+
+
+async def cancel_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """
+    Handles inline 'Cancel' button taps during comment setup.
+    """
+    query = update.callback_query
+    await query.answer()
+    context.user_data.pop("is_anonymous", None)
+
+    await query.edit_message_text(
+        "❌ Comment submission canceled.\n\n"
+        "Send /start whenever you'd like to share something with us!"
+    )
     return ConversationHandler.END
 
 
@@ -346,14 +432,20 @@ def main() -> None:
             CallbackQueryHandler(start_comment_callback, pattern="^send_comment$"),
         ],
         states={
+            CHOOSING_ANONYMITY: [
+                CallbackQueryHandler(set_comment_mode, pattern="^mode_(named|anon)$"),
+                CallbackQueryHandler(cancel_callback, pattern="^cancel_comment$"),
+            ],
             WAITING_FOR_COMMENT: [
                 CallbackQueryHandler(start_comment_callback, pattern="^send_comment$"),
+                CallbackQueryHandler(set_comment_mode, pattern="^mode_(named|anon)$"),
                 MessageHandler(~filters.COMMAND, handle_comment),
             ],
         },
         fallbacks=[
             CommandHandler("start", start_command),
             CommandHandler("cancel", cancel_command),
+            CallbackQueryHandler(cancel_callback, pattern="^cancel_comment$"),
         ],
         allow_reentry=True,
     )
