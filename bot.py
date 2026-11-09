@@ -2,14 +2,21 @@
 """
 Bale Helm Telegram Bot
 A Telegram bot for the Bale Helm channel (https://t.me/bale_helm).
-Collects comments, feedback, and suggestions from members (with optional anonymity)
-and forwards them to the channel admin.
-Enables the admin to reply directly to user comments from Telegram.
+
+Features:
+- Differentiated experiences for regular members and channel administrator.
+- Member flow: Submit comments (with optional anonymity: With Name or Anonymous).
+- Admin restriction: Administrator cannot send comments to themselves.
+- Admin dashboard: Statistics, Announcement broadcasting, direct /reply command, and reply guide.
+- Two-way messaging: Admin replies to forwarded comments or uses /reply <user_id> <msg>.
 """
 
+from datetime import datetime, timezone
 import html
+import json
 import logging
 import os
+from pathlib import Path
 import re
 import sys
 from typing import Optional
@@ -59,6 +66,67 @@ logger = logging.getLogger("bale_helm_bot")
 # Conversation states
 CHOOSING_ANONYMITY = 1
 WAITING_FOR_COMMENT = 2
+WAITING_FOR_BROADCAST = 3
+
+# Data persistence file
+DATA_DIR = Path(__file__).parent / "data"
+DATA_FILE = DATA_DIR / "bot_data.json"
+
+
+# ---------------------------------------------------------------------------
+# Lightweight Persistence Helpers
+# ---------------------------------------------------------------------------
+def load_data() -> dict:
+    """Loads stored bot statistics and user list."""
+    if DATA_FILE.exists():
+        try:
+            with open(DATA_FILE, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception as e:
+            logger.warning("Failed to read %s: %s", DATA_FILE, e)
+    return {
+        "users": [],
+        "total_comments": 0,
+        "named_comments": 0,
+        "anonymous_comments": 0,
+        "last_comment_at": None,
+    }
+
+
+def save_data(data: dict) -> None:
+    """Saves bot statistics and user list atomically."""
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    temp_file = DATA_FILE.with_suffix(".tmp")
+    try:
+        with open(temp_file, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2, ensure_ascii=False)
+        temp_file.replace(DATA_FILE)
+    except Exception as e:
+        logger.error("Failed to write %s: %s", DATA_FILE, e)
+
+
+def register_user(user_id: int) -> None:
+    """Registers a member's user ID so they can receive admin broadcasts."""
+    if user_id <= 0 or user_id == ADMIN_ID:
+        return
+    data = load_data()
+    users = set(data.get("users", []))
+    if user_id not in users:
+        users.add(user_id)
+        data["users"] = sorted(list(users))
+        save_data(data)
+
+
+def record_comment(is_anonymous: bool) -> None:
+    """Updates submission metrics."""
+    data = load_data()
+    data["total_comments"] = data.get("total_comments", 0) + 1
+    if is_anonymous:
+        data["anonymous_comments"] = data.get("anonymous_comments", 0) + 1
+    else:
+        data["named_comments"] = data.get("named_comments", 0) + 1
+    data["last_comment_at"] = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+    save_data(data)
 
 
 # ---------------------------------------------------------------------------
@@ -99,8 +167,8 @@ def extract_user_id_from_message(message: Optional[Message]) -> Optional[int]:
     return None
 
 
-def get_start_keyboard() -> InlineKeyboardMarkup:
-    """Returns the main inline keyboard shown on /start."""
+def get_member_start_keyboard() -> InlineKeyboardMarkup:
+    """Returns the main inline keyboard shown to members on /start."""
     keyboard = [
         [InlineKeyboardButton("💬 Send a comment", callback_data="send_comment")]
     ]
@@ -119,16 +187,72 @@ def get_anonymity_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(keyboard)
 
 
+def get_admin_dashboard_keyboard() -> InlineKeyboardMarkup:
+    """Returns the admin control panel keyboard."""
+    keyboard = [
+        [
+            InlineKeyboardButton("📊 Statistics", callback_data="admin_stats"),
+            InlineKeyboardButton("📢 Broadcast", callback_data="admin_broadcast"),
+        ],
+        [
+            InlineKeyboardButton("📖 Reply Guide", callback_data="admin_guide"),
+            InlineKeyboardButton("🔗 Open Channel", url=CHANNEL_URL),
+        ],
+        [
+            InlineKeyboardButton("🔄 Refresh Dashboard", callback_data="admin_refresh"),
+        ],
+    ]
+    return InlineKeyboardMarkup(keyboard)
+
+
+def build_admin_dashboard_text(user_first_name: str) -> str:
+    """Generates the welcome text for the admin dashboard."""
+    return (
+        f"👑 <b>Admin Dashboard — Bale Helm</b>\n\n"
+        f"Welcome back, <b>{html.escape(user_first_name)}</b>!\n"
+        f"Channel: <a href=\"{CHANNEL_URL}\">t.me/bale_helm</a>\n"
+        f"Status: 🟢 <b>Active & Listening for Comments</b>\n\n"
+        f"Use the buttons below to check stats, broadcast announcements, or review instructions."
+    )
+
+
 # ---------------------------------------------------------------------------
-# User Handlers: Start, Cancel & Comment Submission
+# Handlers: Start & Cancel
 # ---------------------------------------------------------------------------
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     """
-    Handles /start command. Greets the user, links to @bale_helm,
-    and displays the '💬 Send a comment' button.
+    Handles /start.
+    - If caller is ADMIN: presents the Admin Dashboard.
+    - If caller is a regular member: registers user and presents the member comment prompt.
     """
     context.user_data.pop("is_anonymous", None)
-    user_name = update.effective_user.first_name if update.effective_user else "there"
+    user = update.effective_user
+    if not user:
+        return ConversationHandler.END
+
+    # ADMIN USER VIEW
+    if user.id == ADMIN_ID:
+        dashboard_text = build_admin_dashboard_text(user.first_name)
+        if update.callback_query:
+            await update.callback_query.answer()
+            await update.callback_query.edit_message_text(
+                text=dashboard_text,
+                reply_markup=get_admin_dashboard_keyboard(),
+                parse_mode=ParseMode.HTML,
+                disable_web_page_preview=True,
+            )
+        elif update.message:
+            await update.message.reply_text(
+                text=dashboard_text,
+                reply_markup=get_admin_dashboard_keyboard(),
+                parse_mode=ParseMode.HTML,
+                disable_web_page_preview=True,
+            )
+        return ConversationHandler.END
+
+    # REGULAR MEMBER VIEW
+    register_user(user.id)
+    user_name = user.first_name or "there"
     welcome_text = (
         f"👋 Hello, <b>{html.escape(user_name)}</b>!\n\n"
         f"Welcome to the official bot for <b>Bale Helm | ባለ ሕልም</b> "
@@ -141,14 +265,14 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
         await update.callback_query.answer()
         await update.callback_query.edit_message_text(
             text=welcome_text,
-            reply_markup=get_start_keyboard(),
+            reply_markup=get_member_start_keyboard(),
             parse_mode=ParseMode.HTML,
             disable_web_page_preview=True,
         )
     elif update.message:
         await update.message.reply_text(
             text=welcome_text,
-            reply_markup=get_start_keyboard(),
+            reply_markup=get_member_start_keyboard(),
             parse_mode=ParseMode.HTML,
             disable_web_page_preview=True,
         )
@@ -156,13 +280,49 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
     return ConversationHandler.END
 
 
+async def cancel_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Cancels the active operation (comment or broadcast)."""
+    context.user_data.pop("is_anonymous", None)
+    if update.message:
+        await update.message.reply_text(
+            "❌ Action canceled.\n\n"
+            "Send /start whenever you would like to begin again."
+        )
+    return ConversationHandler.END
+
+
+async def cancel_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Handles inline 'Cancel' button taps."""
+    query = update.callback_query
+    await query.answer()
+    context.user_data.pop("is_anonymous", None)
+
+    await query.edit_message_text(
+        "❌ Action canceled.\n\n"
+        "Send /start whenever you would like to begin again."
+    )
+    return ConversationHandler.END
+
+
+# ---------------------------------------------------------------------------
+# Member Handlers: Comment Submission Flow
+# ---------------------------------------------------------------------------
 async def start_comment_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     """
-    Triggered when the user taps '💬 Send a comment'.
-    Presents the choice between submitting with their name or anonymously.
+    Triggered when a member taps '💬 Send a comment'.
+    Prevents admin from submitting comments to themselves.
     """
     query = update.callback_query
     await query.answer()
+
+    # Restriction: Admin cannot send comments to themselves
+    if update.effective_user.id == ADMIN_ID:
+        await query.message.reply_text(
+            "⚠️ <b>Administrator Notice:</b> You cannot send comments to yourself.\n\n"
+            "Use the Admin Dashboard (/start) to check stats or broadcast messages.",
+            parse_mode=ParseMode.HTML,
+        )
+        return ConversationHandler.END
 
     prompt_text = (
         "🔒 <b>Choose comment mode:</b>\n\n"
@@ -181,9 +341,7 @@ async def start_comment_callback(update: Update, context: ContextTypes.DEFAULT_T
 
 
 async def set_comment_mode(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """
-    Records whether the comment will be anonymous and prompts for the message.
-    """
+    """Records anonymity choice and prompts for the message."""
     query = update.callback_query
     await query.answer()
 
@@ -210,13 +368,7 @@ async def set_comment_mode(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 
 async def handle_comment(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     """
-    Receives the user's comment (any message type) and forwards it to ADMIN_ID.
-    Respects the anonymity choice:
-      - If anonymous: hides full name and username.
-      - If with name: includes full name and @username.
-    Sends:
-      1. An HTML-formatted header with details and user ID.
-      2. The user's original message copied right underneath as a reply to the header.
+    Receives member's comment and forwards it to ADMIN_ID with header + copy.
     """
     user = update.effective_user
     chat = update.effective_chat
@@ -224,6 +376,13 @@ async def handle_comment(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
     if not user or not incoming_msg:
         return WAITING_FOR_COMMENT
+
+    # Extra safety check against admin self-comments
+    if user.id == ADMIN_ID:
+        await incoming_msg.reply_text(
+            "⚠️ You are the administrator of this bot. Comments cannot be sent to yourself."
+        )
+        return ConversationHandler.END
 
     if not ADMIN_ID:
         logger.error("ADMIN_ID is not configured in .env! Cannot forward comment.")
@@ -255,14 +414,14 @@ async def handle_comment(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         )
 
     try:
-        # Step 1: Send the header message to the admin
+        # Step 1: Send header message to admin
         header_message = await context.bot.send_message(
             chat_id=ADMIN_ID,
             text=header_text,
             parse_mode=ParseMode.HTML,
         )
 
-        # Step 2: Copy the user's message right underneath as a reply to the header
+        # Step 2: Copy user message right underneath as reply to header
         await context.bot.copy_message(
             chat_id=ADMIN_ID,
             from_chat_id=chat.id,
@@ -270,7 +429,10 @@ async def handle_comment(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             reply_parameters=ReplyParameters(message_id=header_message.message_id),
         )
 
-        # Step 3: Confirm to user
+        # Step 3: Record stats and confirm to user
+        record_comment(is_anonymous=is_anonymous)
+        register_user(user_id)
+
         confirmation_text = (
             "✅ <b>Thank you!</b> Your anonymous comment has been delivered to the channel admin.\n\n"
             "You can send /start anytime to submit another message."
@@ -292,7 +454,7 @@ async def handle_comment(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
     except Forbidden:
         logger.error(
-            "Cannot message ADMIN_ID %s: Bot was blocked or the admin has never pressed Start on the bot.",
+            "Cannot message ADMIN_ID %s: Bot was blocked or admin has never pressed Start on the bot.",
             ADMIN_ID,
         )
         await incoming_msg.reply_text(
@@ -310,36 +472,219 @@ async def handle_comment(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     return ConversationHandler.END
 
 
-async def cancel_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """
-    Cancels the comment submission process and resets the state.
-    """
-    context.user_data.pop("is_anonymous", None)
-    if update.message:
-        await update.message.reply_text(
-            "❌ Comment submission canceled.\n\n"
-            "Send /start whenever you'd like to share something with us!"
-        )
-    return ConversationHandler.END
-
-
-async def cancel_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """
-    Handles inline 'Cancel' button taps during comment setup.
-    """
+# ---------------------------------------------------------------------------
+# Admin Features: Dashboard, Statistics, Broadcast & Direct Reply
+# ---------------------------------------------------------------------------
+async def admin_callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Routes callback queries initiated from the Admin Dashboard."""
     query = update.callback_query
     await query.answer()
-    context.user_data.pop("is_anonymous", None)
 
-    await query.edit_message_text(
-        "❌ Comment submission canceled.\n\n"
-        "Send /start whenever you'd like to share something with us!"
-    )
+    if update.effective_user.id != ADMIN_ID:
+        await query.message.reply_text("⛔ Restricted to channel administrator.")
+        return ConversationHandler.END
+
+    action = query.data
+
+    if action in ("admin_dashboard", "admin_refresh"):
+        await query.edit_message_text(
+            text=build_admin_dashboard_text(update.effective_user.first_name),
+            reply_markup=get_admin_dashboard_keyboard(),
+            parse_mode=ParseMode.HTML,
+            disable_web_page_preview=True,
+        )
+        return ConversationHandler.END
+
+    elif action == "admin_stats":
+        data = load_data()
+        total_users = len(data.get("users", []))
+        total_comments = data.get("total_comments", 0)
+        named_comments = data.get("named_comments", 0)
+        anon_comments = data.get("anonymous_comments", 0)
+        last_comment = data.get("last_comment_at") or "None yet"
+
+        stats_text = (
+            "📊 <b>Bale Helm Bot — Statistics</b>\n\n"
+            f"👥 <b>Active Members Tracked:</b> <code>{total_users}</code>\n"
+            f"📬 <b>Total Comments Received:</b> <code>{total_comments}</code>\n"
+            f"  • 👤 <b>With Name:</b> <code>{named_comments}</code>\n"
+            f"  • 🕵️ <b>Anonymous:</b> <code>{anon_comments}</code>\n"
+            f"🕒 <b>Last Submission:</b> <code>{last_comment}</code>\n"
+        )
+        keyboard = [[InlineKeyboardButton("« Back to Dashboard", callback_data="admin_dashboard")]]
+        await query.edit_message_text(
+            text=stats_text,
+            reply_markup=InlineKeyboardMarkup(keyboard),
+            parse_mode=ParseMode.HTML,
+        )
+        return ConversationHandler.END
+
+    elif action == "admin_guide":
+        guide_text = (
+            "📖 <b>Admin Instructions & Features</b>\n\n"
+            "<b>1. Replying to Comments:</b>\n"
+            "• Swipe or reply directly to any comment header or message in this chat.\n"
+            "• Your response is sent to the user prefixed with <code>💌 Reply from the channel admin:</code>.\n"
+            "• Works for both named and anonymous comments.\n\n"
+            "<b>2. Direct Message Command:</b>\n"
+            "• Send <code>/reply &lt;user_id&gt; &lt;message&gt;</code> to message a member directly.\n\n"
+            "<b>3. Broadcast Announcements:</b>\n"
+            "• Tap <b>Broadcast</b> in the dashboard or send <code>/broadcast</code> to message all members.\n\n"
+            "<b>4. Quick Stats:</b>\n"
+            "• Use <code>/stats</code> anytime to view real-time comment metrics."
+        )
+        keyboard = [[InlineKeyboardButton("« Back to Dashboard", callback_data="admin_dashboard")]]
+        await query.edit_message_text(
+            text=guide_text,
+            reply_markup=InlineKeyboardMarkup(keyboard),
+            parse_mode=ParseMode.HTML,
+        )
+        return ConversationHandler.END
+
+    elif action == "admin_broadcast":
+        data = load_data()
+        member_count = len(data.get("users", []))
+        prompt_text = (
+            "📢 <b>Broadcast Announcement</b>\n\n"
+            f"Currently <b>{member_count}</b> member(s) are registered to receive broadcasts.\n\n"
+            "<b>Send the message or media you want to broadcast now.</b>\n"
+            "It will be forwarded to all active bot users.\n\n"
+            "<i>Send /cancel at any time to abort.</i>"
+        )
+        await query.message.reply_text(
+            text=prompt_text,
+            parse_mode=ParseMode.HTML,
+        )
+        return WAITING_FOR_BROADCAST
+
     return ConversationHandler.END
+
+
+async def broadcast_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Command shortcut (/broadcast) for channel admin."""
+    if update.effective_user.id != ADMIN_ID:
+        await update.message.reply_text("⛔ Restricted to channel administrator.")
+        return ConversationHandler.END
+
+    data = load_data()
+    member_count = len(data.get("users", []))
+    prompt_text = (
+        "📢 <b>Broadcast Announcement</b>\n\n"
+        f"Currently <b>{member_count}</b> member(s) are registered to receive broadcasts.\n\n"
+        "<b>Send the message or media you want to broadcast now.</b>\n\n"
+        "<i>Send /cancel at any time to abort.</i>"
+    )
+    await update.message.reply_text(text=prompt_text, parse_mode=ParseMode.HTML)
+    return WAITING_FOR_BROADCAST
+
+
+async def handle_broadcast_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Broadcasts admin's message to all registered users."""
+    if update.effective_user.id != ADMIN_ID:
+        return ConversationHandler.END
+
+    admin_msg = update.effective_message
+    data = load_data()
+    recipients = data.get("users", [])
+
+    if not recipients:
+        await admin_msg.reply_text("ℹ️ No members have interacted with the bot yet to broadcast to.")
+        return ConversationHandler.END
+
+    status_msg = await admin_msg.reply_text(
+        f"⏳ Broadcasting message to {len(recipients)} member(s)..."
+    )
+
+    success_count = 0
+    fail_count = 0
+
+    for user_id in recipients:
+        try:
+            await context.bot.copy_message(
+                chat_id=user_id,
+                from_chat_id=update.effective_chat.id,
+                message_id=admin_msg.message_id,
+            )
+            success_count += 1
+        except Exception:
+            fail_count += 1
+
+    await status_msg.edit_text(
+        f"📢 <b>Broadcast Completed!</b>\n\n"
+        f"✅ <b>Delivered:</b> <code>{success_count}</code>\n"
+        f"❌ <b>Blocked / Failed:</b> <code>{fail_count}</code>\n"
+        f"👥 <b>Total Attempted:</b> <code>{len(recipients)}</code>",
+        parse_mode=ParseMode.HTML,
+    )
+
+    return ConversationHandler.END
+
+
+async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Command shortcut (/stats) for channel admin."""
+    if update.effective_user.id != ADMIN_ID:
+        await update.message.reply_text("⛔ Restricted to channel administrator.")
+        return
+
+    data = load_data()
+    total_users = len(data.get("users", []))
+    total_comments = data.get("total_comments", 0)
+    named_comments = data.get("named_comments", 0)
+    anon_comments = data.get("anonymous_comments", 0)
+    last_comment = data.get("last_comment_at") or "None yet"
+
+    stats_text = (
+        "📊 <b>Bale Helm Bot — Statistics</b>\n\n"
+        f"👥 <b>Active Members Tracked:</b> <code>{total_users}</code>\n"
+        f"📬 <b>Total Comments Received:</b> <code>{total_comments}</code>\n"
+        f"  • 👤 <b>With Name:</b> <code>{named_comments}</code>\n"
+        f"  • 🕵️ <b>Anonymous:</b> <code>{anon_comments}</code>\n"
+        f"🕒 <b>Last Submission:</b> <code>{last_comment}</code>\n"
+    )
+    await update.message.reply_text(stats_text, parse_mode=ParseMode.HTML)
+
+
+async def reply_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    Direct message command (/reply <user_id> <message>) for channel admin.
+    Allows admin to message any user directly by their numeric Telegram ID.
+    """
+    if update.effective_user.id != ADMIN_ID:
+        await update.message.reply_text("⛔ Restricted to channel administrator.")
+        return
+
+    if not context.args or len(context.args) < 2:
+        await update.message.reply_text(
+            "ℹ️ <b>Usage:</b> <code>/reply &lt;user_id&gt; &lt;your message&gt;</code>\n\n"
+            "Example: <code>/reply 12345678 Thank you for your feedback!</code>",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    try:
+        target_id = int(context.args[0])
+    except ValueError:
+        await update.message.reply_text("❌ Invalid user ID. It must be numeric.")
+        return
+
+    reply_body = " ".join(context.args[1:])
+    prefix = "💌 Reply from the channel admin:\n\n"
+    full_text = f"{prefix}{reply_body}"
+
+    try:
+        await context.bot.send_message(chat_id=target_id, text=full_text)
+        await update.message.reply_text(f"✅ Delivered to user <code>{target_id}</code>.", parse_mode=ParseMode.HTML)
+    except Forbidden:
+        await update.message.reply_text(
+            f"❌ Delivery failed: User <code>{target_id}</code> has blocked the bot or not started it.",
+            parse_mode=ParseMode.HTML,
+        )
+    except TelegramError as e:
+        await update.message.reply_text(f"❌ Delivery failed: {html.escape(str(e))}")
 
 
 # ---------------------------------------------------------------------------
-# Admin Reply Handler
+# Admin Reply Handler (Reply-to-Message in Chat)
 # ---------------------------------------------------------------------------
 async def handle_admin_reply(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """
@@ -354,21 +699,18 @@ async def handle_admin_reply(update: Update, context: ContextTypes.DEFAULT_TYPE)
     # Extract target user ID from the header or the parent of the copied message
     target_user_id = extract_user_id_from_message(admin_msg.reply_to_message)
     if not target_user_id:
-        # Not a reply to a user comment header/copied message; ignore quietly
         return
 
     prefix = "💌 Reply from the channel admin:"
 
     try:
         if admin_msg.text:
-            # Text reply
             full_reply_text = f"{prefix}\n\n{admin_msg.text}"
             await context.bot.send_message(
                 chat_id=target_user_id,
                 text=full_reply_text,
             )
         else:
-            # Media reply (photo, video, voice, document, etc.)
             if admin_msg.caption:
                 new_caption = f"{prefix}\n\n{admin_msg.caption}"
                 await context.bot.copy_message(
@@ -425,11 +767,17 @@ def main() -> None:
         MessageHandler(admin_reply_filter, handle_admin_reply)
     )
 
-    # 2. Conversation Handler for user comment submission
+    # 2. Admin direct commands
+    application.add_handler(CommandHandler("reply", reply_command))
+    application.add_handler(CommandHandler("stats", stats_command))
+
+    # 3. Main Conversation Handler (Comment submission & Broadcast)
     conv_handler = ConversationHandler(
         entry_points=[
             CommandHandler("start", start_command),
+            CommandHandler("broadcast", broadcast_command),
             CallbackQueryHandler(start_comment_callback, pattern="^send_comment$"),
+            CallbackQueryHandler(admin_callback_router, pattern="^admin_"),
         ],
         states={
             CHOOSING_ANONYMITY: [
@@ -441,6 +789,12 @@ def main() -> None:
                 CallbackQueryHandler(set_comment_mode, pattern="^mode_(named|anon)$"),
                 MessageHandler(~filters.COMMAND, handle_comment),
             ],
+            WAITING_FOR_BROADCAST: [
+                MessageHandler(
+                    ~filters.COMMAND & filters.User(user_id=ADMIN_ID),
+                    handle_broadcast_message,
+                ),
+            ],
         },
         fallbacks=[
             CommandHandler("start", start_command),
@@ -451,7 +805,7 @@ def main() -> None:
     )
     application.add_handler(conv_handler)
 
-    # 3. Global cancel command fallback (for users not currently in conversation state)
+    # 4. Global cancel command fallback
     application.add_handler(CommandHandler("cancel", cancel_command))
 
     logger.info("Starting Bale Helm bot with long polling...")
